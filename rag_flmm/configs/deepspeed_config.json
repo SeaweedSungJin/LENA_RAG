@@ -1,0 +1,26 @@
+{
+    "gradient_accumulation_steps": 1,
+    "optimizer": {
+        "type": "AdamW",
+        "params": {
+            "lr": 2e-4
+        }
+    },
+    "bf16": {
+        "enabled": false
+    },
+    "fp16": {
+        "enabled": true,
+        "initial_scale_power": 12,
+        "loss_scale_window": 1000,
+        "hysteresis": 2,
+        "min_loss_scale": 1
+    },
+    "zero_optimization": {
+        "stage": 2,
+        "allgather_partitions": true,
+        "reduce_scatter": true,
+        "allgather_bucket_size": 2e8,
+        "reduce_bucket_size": 2e8
+    }
+}

@@ -1,0 +1,20 @@
+# Example configuration for EchoSight (LENA) NLI sentence selection
+model_name: FacebookAI/roberta-large-mnli
+device: cuda:0
+max_length: 512
+batch_size: 64
+convert_question: true
+question_entail_threshold: 0.5
+alpha: 1.0
+beta: 1.0
+margin: 0.15
+tau: 0.25
+target_size: 3
+reduction_mode: recompute
+reduction_epsilon: 1e-6
+hybrid_lambda: 0.5
+sentence_batch_size: 128
+keep_top_k_on_empty: 5
+dataset_start: 0
+dataset_end: 4750
+dataset_limit: 5750
