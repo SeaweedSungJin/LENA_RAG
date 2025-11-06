@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import math
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
@@ -11,6 +10,11 @@ import torch
 from PIL import Image
 
 from .config import RouterConfig
+from .mmengine_loader import (
+    ensure_vendor_paths,
+    load_frozen_llava_components,
+    resolve_router_checkpoint,
+)
 
 
 @dataclass
@@ -75,32 +79,15 @@ class FrozenRouterBackend(BaseRouterBackend):
     def __init__(self, cfg: RouterConfig) -> None:
         super().__init__(cfg)
 
-        # Register vendored flmm modules so mmengine config imports succeed.
-        project_root = Path(__file__).resolve().parent.parent
-        rag_flmm_root = project_root / "rag_flmm"
-        if rag_flmm_root.exists():
-            sys_path_entry = str(rag_flmm_root)
-            if sys_path_entry not in sys.path:
-                sys.path.insert(0, sys_path_entry)
+        ensure_vendor_paths()
 
         try:
-            from mmengine.config import Config as MMConfig
-            from xtuner.registry import BUILDER
             from xtuner.model.utils import guess_load_checkpoint
         except Exception as exc:  # pragma: no cover - dependency import
             raise RuntimeError("mmengine/xtuner are required for the mmengine router backend") from exc
 
         if cfg.config_path is None:
             raise ValueError("RouterConfig.config_path must be provided for backend 'mmengine'")
-
-        self._MMConfig = MMConfig
-        self._BUILDER = BUILDER
-        self._guess_load_checkpoint = guess_load_checkpoint
-
-        mm_cfg = MMConfig.fromfile(str(cfg.config_path))
-        self._prompt_template = mm_cfg.get("prompt_template", {})
-        if "INSTRUCTION" not in self._prompt_template:
-            raise ValueError("prompt_template with INSTRUCTION key is required in mmengine config")
 
         device = torch.device(cfg.device)
 
@@ -129,7 +116,18 @@ class FrozenRouterBackend(BaseRouterBackend):
 
         torch.load = _patched_torch_load  # type: ignore[assignment]
         try:
-            model = BUILDER.build(mm_cfg.model).to(device)
+            (
+                model,
+                tokenizer,
+                prompt_template,
+                image_processor,
+                default_image_token,
+                default_rag_token,
+            ) = load_frozen_llava_components(
+                config_path=cfg.config_path,
+                device=cfg.device,
+                checkpoint_path=cfg.checkpoint_path,
+            )
 
             base_module = (
                 getattr(model, "llm", None)
@@ -157,18 +155,14 @@ class FrozenRouterBackend(BaseRouterBackend):
             self._device = device
             self._debug_samples = 0
 
+            self._tokenizer = tokenizer
+            self._prompt_template = prompt_template
+            if "INSTRUCTION" not in self._prompt_template:
+                raise ValueError("prompt_template with INSTRUCTION key is required in mmengine config")
+
             self._materialize_router_head()
 
-            if cfg.checkpoint_path:
-                state = guess_load_checkpoint(str(cfg.checkpoint_path))
-                state = self._remap_checkpoint_keys(state)
-                missing, unexpected = model.load_state_dict(state, strict=False)
-                if missing:
-                    print(f"[Router] checkpoint missing ({len(missing)}): {missing[:8]}")
-                if unexpected:
-                    print(f"[Router] checkpoint unexpected ({len(unexpected)}): {unexpected[:8]}")
-
-            router_ckpt = cfg.router_checkpoint
+            router_ckpt = resolve_router_checkpoint(cfg.router_checkpoint)
             if router_ckpt:
                 state = guess_load_checkpoint(str(router_ckpt))
                 state = self._remap_checkpoint_keys(state)
@@ -188,38 +182,17 @@ class FrozenRouterBackend(BaseRouterBackend):
                         print(f"[Router] router_ckpt unexpected ({len(unexpected_r)}): {unexpected_r[:8]}")
                 else:
                     print(f"[Router] router state not found in {router_ckpt}")
+            elif cfg.router_checkpoint:
+                print(f"[Router] router checkpoint not found: {cfg.router_checkpoint}")
 
             model.eval()
         finally:
             torch.load = orig_torch_load  # type: ignore[assignment]
 
-        tokenizer = getattr(model, "tokenizer", None)
-        if tokenizer is None:
-            tok_cfg = mm_cfg.get("tokenizer", None)
-            if tok_cfg is None:
-                raise RuntimeError("Tokenizer config missing; cannot build router tokenizer.")
-            tokenizer = BUILDER.build(tok_cfg)
+        self._image_processor = image_processor
 
-            base = (
-                getattr(model, "llm", None)
-                or getattr(model, "llava", None)
-                or getattr(model, "language_model", None)
-                or getattr(model, "model", None)
-            )
-            if base is not None and hasattr(base, "resize_token_embeddings"):
-                try:
-                    base.resize_token_embeddings(len(tokenizer))
-                except Exception:  # pragma: no cover - best effort
-                    pass
-        self._tokenizer = tokenizer
-
-        img_proc_cfg = mm_cfg.get("image_processor", None)
-        if img_proc_cfg is None:
-            raise RuntimeError("image_processor missing in mmengine config")
-        self._image_processor = BUILDER.build(img_proc_cfg)
-
-        self._image_token = cfg.image_token or mm_cfg.get("image_token", "<image>")
-        self._rag_token = cfg.rag_token or getattr(model, "rag_token", "[RAG]")
+        self._image_token = cfg.image_token or default_image_token
+        self._rag_token = cfg.rag_token or default_rag_token
 
     def _collect_router_state(self, payload: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         key_frags = ("rag_router", "router_head", "router.", "mlp_router")
@@ -227,12 +200,17 @@ class FrozenRouterBackend(BaseRouterBackend):
 
         def _visit(obj: Dict[str, torch.Tensor]) -> None:
             for key, value in obj.items():
-                if any(frag in key for frag in key_frags):
-                    router_state[key] = value
+                if isinstance(key, str) and any(frag in key for frag in key_frags):
+                    new_key = key[len("module.") :] if key.startswith("module.") else key
+                    router_state[new_key] = value
+                elif isinstance(value, dict):
+                    _visit(value)
 
         if isinstance(payload, dict):
             if "state_dict" in payload:
                 _visit(payload["state_dict"])
+            elif "module" in payload and isinstance(payload["module"], dict):
+                _visit(payload["module"])
             else:
                 _visit(payload)
         return router_state
@@ -258,12 +236,27 @@ class FrozenRouterBackend(BaseRouterBackend):
             txt_feat = torch.zeros(1, txt_dim, device=device, dtype=dtype)
             vis_feat = torch.zeros(1, vis_dim, device=device, dtype=dtype)
 
+            vocab_size = None
+            llm = getattr(model, "llm", None)
+            if llm is not None:
+                vocab_size = getattr(getattr(llm, "config", None), "vocab_size", None)
+            if vocab_size is None:
+                vocab_size = getattr(model, "vocab_size", None)
+            if vocab_size is None and hasattr(self, "_tokenizer"):
+                try:
+                    vocab_size = len(self._tokenizer)
+                except Exception:
+                    vocab_size = None
+            txt_logits = None
+            if isinstance(vocab_size, int) and vocab_size > 0:
+                txt_logits = torch.zeros(1, vocab_size, device=device, dtype=dtype)
+
             with torch.no_grad():
                 router(
                     base_feat=base_feat,
                     txt_feat=txt_feat,
                     vis_feat=vis_feat,
-                    txt_logits=None,
+                    txt_logits=txt_logits,
                     vis_logits=None,
                     ret_stats=None,
                 )
@@ -276,12 +269,14 @@ class FrozenRouterBackend(BaseRouterBackend):
         remapped: Dict[str, torch.Tensor] = {}
         for key, value in state.items():
             new_key = key
-            if key.startswith("llm.base_model.model.model."):
-                new_key = "llm.model." + key[len("llm.base_model.model.model.") :]
-            elif key.startswith("llm.base_model.model."):
-                new_key = "llm.model." + key[len("llm.base_model.model.") :]
-            elif key.startswith("llm.base_model."):
-                new_key = "llm." + key[len("llm.base_model.") :]
+            if new_key.startswith("module."):
+                new_key = new_key[len("module.") :]
+            if new_key.startswith("llm.base_model.model.model."):
+                new_key = "llm.model." + new_key[len("llm.base_model.model.model.") :]
+            elif new_key.startswith("llm.base_model.model."):
+                new_key = "llm.model." + new_key[len("llm.base_model.model.") :]
+            elif new_key.startswith("llm.base_model."):
+                new_key = "llm." + new_key[len("llm.base_model.") :]
             remapped[new_key] = value
         return remapped
 
