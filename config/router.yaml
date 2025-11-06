@@ -1,7 +1,7 @@
 enabled: true
 backend: mmengine
 threshold: 0.5
-device: cuda:3
+device: cuda:1
 config_path: ../rag_flmm/configs/llava/frozen_llava_1_5_vicuna_7b_unet_sam_l_refcoco_png.py
-router_checkpoint: /dataset/router/routernetv3/iter_70000_fp32/pytorch_model.bin
-checkpoint_path: /dataset/router/routernetv3/iter_70000_fp32/pytorch_model.bin
+router_checkpoint:  /dataset/router/routernetv3/pytorch_model.bin
+checkpoint_path:  /dataset/router/routernetv3/pytorch_model.bin

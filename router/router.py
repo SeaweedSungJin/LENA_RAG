@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import torch
+from PIL import Image
 
 from .config import RouterConfig
 
@@ -57,7 +58,8 @@ class HeuristicRouter(BaseRouterBackend):
         # Squash with tanh for stability
         score = math.tanh(length / 12.0)
         prob = 0.5 + 0.5 * score
-        use_rag = prob >= self.cfg.threshold
+        # Break ties conservatively: prob == threshold -> NO_RAG
+        use_rag = prob > self.cfg.threshold
         return RouterDecision(
             prob=prob,
             threshold=self.cfg.threshold,
@@ -101,21 +103,95 @@ class FrozenRouterBackend(BaseRouterBackend):
             raise ValueError("prompt_template with INSTRUCTION key is required in mmengine config")
 
         device = torch.device(cfg.device)
-        model = BUILDER.build(mm_cfg.model).to(device)
-        if cfg.checkpoint_path:
-            state = guess_load_checkpoint(str(cfg.checkpoint_path))
-            model.load_state_dict(state, strict=False)
 
-        router_ckpt = cfg.router_checkpoint
-        if router_ckpt:
-            state = guess_load_checkpoint(str(router_ckpt))
-            router_state = self._collect_router_state(state)
-            if router_state:
-                model.load_state_dict(router_state, strict=False)
+        # Allow torch.load to deserialize DeepSpeed metadata in older checkpoints.
+        try:
+            from torch.serialization import add_safe_globals  # type: ignore
+            import deepspeed.runtime.fp16.loss_scaler as ds_loss_scaler  # type: ignore
+            import deepspeed.runtime.zero.config as ds_zero_config  # type: ignore
+            import deepspeed.utils.tensor_fragment as ds_tensor_fragment  # type: ignore
 
-        model.eval()
-        self._model = model
-        self._device = device
+            add_safe_globals(
+                [
+                    ds_loss_scaler.DynamicLossScaler,
+                    ds_zero_config.ZeroStageEnum,
+                    ds_tensor_fragment.fragment_address,
+                ]
+            )
+        except Exception:
+            pass
+
+        orig_torch_load = torch.load
+
+        def _patched_torch_load(*args, **kwargs):
+            kwargs.setdefault("weights_only", False)
+            return orig_torch_load(*args, **kwargs)
+
+        torch.load = _patched_torch_load  # type: ignore[assignment]
+        try:
+            model = BUILDER.build(mm_cfg.model).to(device)
+
+            base_module = (
+                getattr(model, "llm", None)
+                or getattr(model, "llava", None)
+                or getattr(model, "language_model", None)
+                or getattr(model, "model", None)
+            )
+            try:
+                first_param = next(
+                    iter(
+                        list(base_module.parameters())
+                        if base_module is not None
+                        else list(model.parameters())
+                    )
+                )
+            except StopIteration:
+                first_param = None
+            self._model_dtype = (
+                first_param.dtype
+                if first_param is not None
+                else getattr(model, "dtype", torch.float16)
+            )
+
+            self._model = model
+            self._device = device
+            self._debug_samples = 0
+
+            self._materialize_router_head()
+
+            if cfg.checkpoint_path:
+                state = guess_load_checkpoint(str(cfg.checkpoint_path))
+                state = self._remap_checkpoint_keys(state)
+                missing, unexpected = model.load_state_dict(state, strict=False)
+                if missing:
+                    print(f"[Router] checkpoint missing ({len(missing)}): {missing[:8]}")
+                if unexpected:
+                    print(f"[Router] checkpoint unexpected ({len(unexpected)}): {unexpected[:8]}")
+
+            router_ckpt = cfg.router_checkpoint
+            if router_ckpt:
+                state = guess_load_checkpoint(str(router_ckpt))
+                state = self._remap_checkpoint_keys(state)
+                router_state = self._collect_router_state(state)
+                mlp_keys = [k for k in router_state if "rag_router.mlp" in k]
+                if router_state:
+                    print(f"[Router] router parameters extracted: {len(router_state)}")
+                    if not mlp_keys:
+                        print(
+                            "[Router] WARNING: router checkpoint is missing 'rag_router.mlp' weights. "
+                            "Router head will fall back to freshly initialised parameters."
+                        )
+                    missing_r, unexpected_r = model.load_state_dict(router_state, strict=False)
+                    if missing_r:
+                        print(f"[Router] router_ckpt missing ({len(missing_r)}): {missing_r[:8]}")
+                    if unexpected_r:
+                        print(f"[Router] router_ckpt unexpected ({len(unexpected_r)}): {unexpected_r[:8]}")
+                else:
+                    print(f"[Router] router state not found in {router_ckpt}")
+
+            model.eval()
+        finally:
+            torch.load = orig_torch_load  # type: ignore[assignment]
 
         tokenizer = getattr(model, "tokenizer", None)
         if tokenizer is None:
@@ -161,9 +237,66 @@ class FrozenRouterBackend(BaseRouterBackend):
                 _visit(payload)
         return router_state
 
+    def _materialize_router_head(self) -> None:
+        """Ensure dynamic router head modules exist before loading weights."""
+
+        model = getattr(self, "_model", None)
+        device = getattr(self, "_device", None)
+        dtype = getattr(self, "_model_dtype", torch.float16)
+        if model is None or device is None:
+            return
+        router = getattr(model, "rag_router", None)
+        if router is None:
+            return
+
+        try:
+            txt_dim = router.txt_proj.in_features
+            vis_dim = router.vis_proj.in_features
+            base_dim = getattr(model, "_router_in_dim", 3 * txt_dim)
+
+            base_feat = torch.zeros(1, base_dim, device=device, dtype=dtype)
+            txt_feat = torch.zeros(1, txt_dim, device=device, dtype=dtype)
+            vis_feat = torch.zeros(1, vis_dim, device=device, dtype=dtype)
+
+            with torch.no_grad():
+                router(
+                    base_feat=base_feat,
+                    txt_feat=txt_feat,
+                    vis_feat=vis_feat,
+                    txt_logits=None,
+                    vis_logits=None,
+                    ret_stats=None,
+                )
+        except Exception as exc:  # pragma: no cover - diagnostic guard
+            print(f"[Router] warning: failed to materialize router head ({exc})")
+
+    def _remap_checkpoint_keys(self, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if not isinstance(state, dict):
+            return state
+        remapped: Dict[str, torch.Tensor] = {}
+        for key, value in state.items():
+            new_key = key
+            if key.startswith("llm.base_model.model.model."):
+                new_key = "llm.model." + key[len("llm.base_model.model.model.") :]
+            elif key.startswith("llm.base_model.model."):
+                new_key = "llm.model." + key[len("llm.base_model.model.") :]
+            elif key.startswith("llm.base_model."):
+                new_key = "llm." + key[len("llm.base_model.") :]
+            remapped[new_key] = value
+        return remapped
+
     def _build_router_sample(self, question: str, image_path: str | Path) -> Dict[str, torch.Tensor]:
+        image_path = Path(image_path)
+        if not image_path.exists():
+            raise FileNotFoundError(f"Router input image not found: {image_path}")
+
         instruction = self._prompt_template["INSTRUCTION"].format(input=question)
-        text_parts = [self._image_token, self._rag_token, instruction]
+        text_parts: list[str] = []
+        if self._image_token:
+            text_parts.append(self._image_token)
+        if self._rag_token:
+            text_parts.append(self._rag_token)
+        text_parts.append(instruction)
         text = " ".join(part for part in text_parts if part)
 
         token_ids = self._tokenizer.encode(text, add_special_tokens=False)
@@ -173,23 +306,60 @@ class FrozenRouterBackend(BaseRouterBackend):
         if bos_id is not None:
             token_ids = [bos_id] + token_ids
 
-        input_ids = torch.tensor(token_ids, dtype=torch.long, device=self._device)
+        base = (
+            getattr(self._model, "llm", None)
+            or getattr(self._model, "llava", None)
+            or getattr(self._model, "language_model", None)
+            or getattr(self._model, "model", None)
+        )
+        device = getattr(base, "device", None)
+        if device is None:
+            device = self._device
+        device = torch.device(device)
+        dtype = getattr(base, "dtype", None)
+        if dtype is None:
+            dtype = getattr(self, "_model_dtype", torch.float16)
+
+        input_ids = torch.tensor(token_ids, dtype=torch.long, device=device)
         attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
 
-        image = self._image_processor.preprocess(str(image_path))
-        pixel_values = image["pixel_values"]
+        with Image.open(str(image_path)) as img:
+            image = img.convert("RGB")
+        processed = self._image_processor.preprocess(image)
+        pixel_values = processed["pixel_values"]
+        if isinstance(pixel_values, list):
+            pixel_values = pixel_values[0]
         if isinstance(pixel_values, torch.Tensor):
-            pixel_values = pixel_values.to(device=self._device, dtype=self._model.dtype if hasattr(self._model, "dtype") else torch.float16)
+            tensor = pixel_values
         else:
-            pixel_values = torch.tensor(pixel_values, device=self._device, dtype=torch.float16)
-        if pixel_values.ndim == 3:
-            pixel_values = pixel_values.unsqueeze(0)
+            tensor = torch.as_tensor(pixel_values)
+        if tensor.ndim == 4 and tensor.size(0) == 1:
+            tensor = tensor.squeeze(0)
+        if tensor.ndim != 3:
+            raise ValueError(
+                f"Router pixel tensor should be 3D after preprocessing, got shape {tuple(tensor.shape)}"
+            )
+        pixel_values = tensor.to(device=device, dtype=dtype, non_blocking=True).contiguous()
 
         sample: Dict[str, torch.Tensor] = {
-            "input_ids": input_ids.unsqueeze(0),
-            "attention_mask": attention_mask.unsqueeze(0),
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
             "pixel_values": pixel_values,
         }
+        if self._debug_samples < 3:
+            self._debug_samples += 1
+            try:
+                print(
+                    f"[Router] sample input_ids={sample['input_ids'].shape} "
+                    f"pixel_values={sample['pixel_values'].shape} device={pixel_values.device}"
+                )
+                pv = sample["pixel_values"].float()
+                print(
+                    f"[Router] pixel stats min={pv.min().item():.4f} "
+                    f"max={pv.max().item():.4f} mean={pv.mean().item():.4f}"
+                )
+            except Exception:
+                pass
         return sample
 
     def score(self, question: str, image_path: str | Path) -> RouterDecision:
@@ -230,6 +400,13 @@ class FrozenRouterBackend(BaseRouterBackend):
         else:
             prob = float(prob_tensor.reshape(-1)[0].item())
 
+        if logit_tensor is not None:
+            try:
+                raw_logit = float(logit_tensor.reshape(-1)[0].item())
+                print(f"[Router] raw_logit={raw_logit:.6e}")
+            except Exception:
+                pass
+
         use_rag = prob >= self.cfg.threshold
         return RouterDecision(
             prob=prob,
@@ -265,4 +442,16 @@ class Router:
             self.backend_name = "heuristic"
 
     def score(self, question: str, image_path: str | Path) -> RouterDecision:
-        return self._backend.score(question, image_path)
+        decision = self._backend.score(question, image_path)
+        try:
+            print(
+                f"[Router] backend={self.backend_name} prob={decision.prob:.4f}\n"
+                f"[Router] threshold={decision.threshold:.4f} -> use_rag={decision.use_rag}"
+            )
+        except Exception:
+            # Best-effort logging; keep inference resilient to formatting issues.
+            print(
+                f"[Router] backend={self.backend_name} prob={decision.prob} "
+                f"threshold={decision.threshold} -> use_rag={decision.use_rag}"
+            )
+        return decision

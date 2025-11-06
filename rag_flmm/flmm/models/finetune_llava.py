@@ -92,6 +92,20 @@ class RouterNetV3(nn.Module):
         x = torch.cat([base_feat, inter, scalars], dim=-1)
 
         self._ensure_mlp(x.size(-1), x.device)  # ★ 여기!
+        if not torch.isfinite(x).all():
+            x_cpu = x.detach().float()
+            print(
+                "[RouterNetV3] Non-finite features detected.",
+                "base_max", base_feat.abs().max().item(),
+                "inter_max", inter.abs().max().item(),
+                "scalars_max", scalars.abs().max().item(),
+            )
+            print(
+                "[RouterNetV3] finite counts",
+                torch.isfinite(base_feat).sum().item(),
+                torch.isfinite(inter).sum().item(),
+                torch.isfinite(scalars).sum().item(),
+            )
         return self.mlp(x).squeeze(-1)
 
 
