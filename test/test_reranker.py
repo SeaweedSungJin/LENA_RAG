@@ -101,6 +101,7 @@ def run_test(
     eval_score = 0
     vqa_total_count = 0
     vqa_correct_count = 0
+    question_generator = None
 
     if kwargs["perform_vqa"]:
         from utils import evaluate_example
@@ -142,6 +143,28 @@ def run_test(
                 load_in_4bit=llm_4bit,
                 torch_dtype=llm_dtype,
             )
+
+    def _generate_answer_with_image(question: str, image_path: str, context_text: str = "", *, max_new_tokens: int | None = 128):
+        max_tokens = int(max_new_tokens or 128)
+        answer = None
+        context_payload = (context_text or "").strip()
+        if router is not None and hasattr(router, "generate_vlm_answer"):
+            try:
+                answer = router.generate_vlm_answer(
+                    question=question,
+                    image_path=image_path,
+                    context=context_payload if context_payload else None,
+                    max_new_tokens=max_tokens,
+                )
+            except Exception:
+                answer = None
+        if (answer is None or answer.strip() == "") and question_generator is not None:
+            answer = question_generator.llm_answering(
+                question=question,
+                entry_section=context_text or "",
+                image_path=image_path,
+            )
+        return answer
     if kwargs["perform_text_rerank"]:
         text_reranker = BgeTextReranker(
             model_path="/remote-home/share/huggingface_model/bge-reranker-v2-m3",
@@ -198,6 +221,8 @@ def run_test(
         miniters=1,
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
     )
+    # No per-runner VLM helpers; use Router.generate_vlm_answer instead.
+
     router_true_count = 0
     router_false_count = 0
     retrieval_result = {}
@@ -224,6 +249,27 @@ def run_test(
         if not use_rag:
             router_false_count += 1
             count_so_far = processed_idx + 1
+            direct_answer = None
+            ctx_text = ""
+            if kwargs["perform_vqa"]:
+                direct_answer = _generate_answer_with_image(
+                    example["question"], image_path, ctx_text, max_new_tokens=kwargs.get("vlm_max_new_tokens", 128)
+                )
+                if direct_answer:
+                    print("answer: ", direct_answer)
+                    print("target answer: ", target_answer)
+                    score = evaluate_example(
+                        example["question"],
+                        reference_list=target_answer,
+                        candidate=direct_answer,
+                        question_type=example["question_type"],
+                    )
+                    eval_score += score
+                    vqa_total_count += 1
+                    if score >= 0.5:
+                        vqa_correct_count += 1
+                    print("score: ", score, "iter: ", count_so_far)
+                    print("eval score: ", eval_score / count_so_far)
             if kwargs["save_result"]:
                 retrieval_result[data_id] = {
                     "retrieved_entries": [],
@@ -231,6 +277,7 @@ def run_test(
                     "router_prob": router_prob,
                     "router_backend": router_backend or "disabled",
                     "use_rag": False,
+                    "answer": direct_answer,
                 }
             continue
         else:
@@ -359,12 +406,24 @@ def run_test(
         if kwargs["perform_vqa"]:
             ctx_n = max(1, int(nli_context_sentences))
             ctx = reranked_sections[:ctx_n] if reranked_sections else (sections[:ctx_n] if sections else [""])
-            answer = question_generator.llm_answering(question=example["question"], entry_section="\n\n".join(ctx))
-            print("answer: ", answer) ; print("target answer: ", target_answer)
-            score = evaluate_example(example["question"], reference_list=target_answer, candidate=answer, question_type=example["question_type"]) 
-            eval_score += score ; vqa_total_count += 1
-            if score >= 0.5: vqa_correct_count += 1
-            print("score: ", score, "iter: ", count_so_far) ; print("eval score: ", eval_score / count_so_far)
+            ctx_text = "\n\n".join(ctx)
+            answer = _generate_answer_with_image(
+                example["question"], image_path, ctx_text, max_new_tokens=kwargs.get("vlm_max_new_tokens", 128)
+            )
+            print("answer: ", answer)
+            print("target answer: ", target_answer)
+            score = evaluate_example(
+                example["question"],
+                reference_list=target_answer,
+                candidate=answer,
+                question_type=example["question_type"],
+            )
+            eval_score += score
+            vqa_total_count += 1
+            if score >= 0.5:
+                vqa_correct_count += 1
+            print("score: ", score, "iter: ", count_so_far)
+            print("eval score: ", eval_score / count_so_far)
 
     if kwargs["save_result"]:
         with open(kwargs["save_result_path"], "w") as f:
@@ -523,8 +582,9 @@ def run_test(
             print("Text Reranking Recalls", hits / count_so_far)
 
         if kwargs["perform_vqa"]:
-            answer = question_generator.llm_answering(
-                question=example["question"], entry_section=reranked_sections[0]
+            ctx_text = reranked_sections[0] if reranked_sections else ""
+            answer = _generate_answer_with_image(
+                example["question"], image_path, ctx_text, max_new_tokens=kwargs.get("vlm_max_new_tokens", 128)
             )
 
             print("answer: ", answer)

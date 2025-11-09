@@ -450,3 +450,147 @@ class Router:
                 f"threshold={decision.threshold} -> use_rag={decision.use_rag}"
             )
         return decision
+
+    # --- VLM direct generation support ---
+    def get_generation_components(self):
+        """Expose VLM components for direct generation when available.
+
+        Returns a dict with keys: model, tokenizer, image_processor,
+        prompt_template, image_token.
+        """
+        backend = getattr(self, "_backend", None)
+        if backend is None:
+            return None
+
+    def generate_vlm_answer(
+        self,
+        question: str,
+        image_path: str | Path,
+        *,
+        context: Optional[str] = None,
+        max_new_tokens: int = 64,
+    ) -> Optional[str]:
+        """Generate an answer using the VLM (image + question) when available.
+
+        Returns a string on success, or None if the backend doesn't support
+        direct generation.
+        """
+        comps = self.get_generation_components()
+        if not comps:
+            return None
+        try:
+            import torch
+            from PIL import Image
+
+            model = comps["model"]
+            tokenizer = comps["tokenizer"]
+            image_processor = comps["image_processor"]
+            prompt_template = comps["prompt_template"]
+            image_token = comps.get("image_token", "<image>")
+
+            # Format prompt similar to rag_flmm integration, with context-aware instructions
+            system_prompt = (prompt_template or {}).get("SYSTEM", "")
+            instruction_template = (prompt_template or {}).get("INSTRUCTION", "{input}")
+            roles = (prompt_template or {}).get("ROLES", ("USER", "ASSISTANT"))
+            user_role = roles[0] if isinstance(roles, (list, tuple)) and len(roles) >= 2 else "USER"
+            assistant_role = roles[1] if isinstance(roles, (list, tuple)) and len(roles) >= 2 else "ASSISTANT"
+
+            question_text = str(question or "").strip()
+            context_text = context.strip() if isinstance(context, str) else ""
+            if isinstance(instruction_template, str) and "{input}" in instruction_template:
+                formatted_question = instruction_template.format(input=question_text)
+            else:
+                formatted_question = question_text if instruction_template is None else f"{instruction_template}\n{question_text}"
+
+            user_blocks = []
+            if context_text:
+                user_blocks.append(f"Context:\n{context_text}")
+            user_blocks.append(f"Question: {formatted_question}")
+            user_blocks.append(
+                "Instructions: Provide a concise factual answer grounded in the image and any provided context. Respond in one or two sentences."
+            )
+            user_line = f"{user_role}: " + "\n".join(user_blocks)
+
+            assistant_label = (prompt_template or {}).get("ASSISTANT", assistant_role)
+            assistant_label = assistant_label.strip() or assistant_role
+            if not assistant_label.endswith(":"):
+                assistant_label = f"{assistant_label}:"
+            assistant_line = f"{assistant_label} Short answer:"
+
+            parts = []
+            if system_prompt:
+                parts.append(system_prompt.strip())
+            if image_token:
+                parts.append(image_token)
+            parts.append(user_line)
+            parts.append(assistant_line)
+            prompt = "\n".join(p for p in parts if p)
+
+            tokenized = tokenizer(prompt, return_tensors="pt")
+            input_ids = tokenized["input_ids"]
+            attention_mask = tokenized.get("attention_mask", torch.ones_like(input_ids))
+
+            # Underlying HF module
+            base = (
+                getattr(model, "llm", None)
+                or getattr(model, "language_model", None)
+                or getattr(model, "model", None)
+                or getattr(model, "llava", None)
+                or model
+            )
+            try:
+                device = next(base.parameters()).device  # type: ignore[attr-defined]
+            except StopIteration:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            dtype = getattr(base, "dtype", torch.float16)
+
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+
+            with Image.open(str(image_path)) as raw_img:
+                img = raw_img.convert("RGB")
+                processed = image_processor.preprocess(img, return_tensors="pt")
+
+            pixel_values = processed.get("pixel_values")
+            if isinstance(pixel_values, torch.Tensor):
+                pixel_values = pixel_values.to(device=device, dtype=dtype)
+            else:
+                pixel_values = torch.tensor(pixel_values, device=device, dtype=dtype)
+            if pixel_values.ndim == 3:
+                pixel_values = pixel_values.unsqueeze(0)
+
+            with torch.no_grad():
+                output_ids = base.generate(  # type: ignore[attr-defined]
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=pixel_values,
+                    max_new_tokens=int(max_new_tokens),
+                    do_sample=False,
+                    use_cache=True,
+                )
+            generated = output_ids[:, input_ids.shape[1]:]
+            answer = tokenizer.batch_decode(
+                generated, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0]
+            return answer.strip()
+        except Exception:
+            return None
+        # Only FrozenRouterBackend exposes these attributes
+        for attr in ("_model", "_tokenizer", "_image_processor", "_prompt_template"):
+            if not hasattr(backend, attr):
+                return None
+        try:
+            model = backend._model
+            tokenizer = backend._tokenizer
+            image_processor = backend._image_processor
+            prompt_template = backend._prompt_template
+            image_token = getattr(backend, "_image_token", "<image>")
+            return {
+                "model": model,
+                "tokenizer": tokenizer,
+                "image_processor": image_processor,
+                "prompt_template": prompt_template,
+                "image_token": image_token,
+            }
+        except Exception:
+            return None

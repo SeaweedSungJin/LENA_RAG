@@ -121,6 +121,22 @@ def _adjust_prompt_length(prompt, desired_token_length):
         return prompt
 
 
+def _build_multimodal_prompt(question: str, context: str = "", include_image_hint: bool = False) -> str:
+    context = (context or "").strip()
+    parts = []
+    if context:
+        parts.append(f"Context:\n{context}")
+    q_line = f"Question: {question.strip()}"
+    parts.append(q_line)
+    guidance = "Instructions: Provide a concise factual answer grounded in the provided context"
+    if include_image_hint:
+        guidance += " and the accompanying image"
+    guidance += ". Respond in at most two sentences."
+    parts.append(guidance)
+    parts.append("Short answer:")
+    return "\n".join(parts)
+
+
 class AnswerGenerator:
     """Question generator for EchoSight."""
 
@@ -276,6 +292,7 @@ class MistralAnswerGenerator(AnswerGenerator):
         entry=None,
         entry_dict=None,
         entry_section=None,
+        image_path=None,
         oracle_setting="subject",
         evidence_sec=None,
     ):
@@ -289,33 +306,29 @@ class MistralAnswerGenerator(AnswerGenerator):
             oracle_setting: The setting for the oracle experiment.
             evidence_sec: The evidence section.
         """
+        context = ""
         if entry is not None:
             context = reconstruct_wiki_article(entry)
-            context = _adjust_prompt_length(context, 4096)
-            prompt = (
-                "Context: " + context + "\nQuestion: " + question + "\nThe answer is:"
-            )
-
         elif entry_dict is not None:
             context = reconstruct_wiki_article(WikipediaKnowledgeBaseEntry(entry_dict))
-            context = _adjust_prompt_length(context, 4096)
-            prompt = (
-                "Context: " + context + "\nQuestion: " + question + "\nThe answer is:"
-            )
-            # prompt = "Entity name: " + WikipediaKnowledgeBaseEntry(entry_dict).title + "\nQuestion: " + question + "\nThe answer is:"#
         elif entry_section is not None:
-            prompt = (
-                "Context: "
-                + entry_section
-                + "\nQuestion: "
-                + question
-                + "\nThe answer is:"
-            )
-        else:
-            prompt = "Question: " + question + "\nThe answer is:"
+            context = entry_section
+        if context:
+            context = _adjust_prompt_length(context, 4096)
+
+        prompt = _build_multimodal_prompt(question, context, include_image_hint=bool(image_path))
 
         messages = [
+            {
+                "role": "system",
+                "content": "You are a concise encyclopedic assistant. Answer with the most relevant fact grounded in the provided context and image. Do not add explanations.",
+            },
             {"role": "user", "content": prompt},
+        ]
+
+        terminators = [
+            self.tokenizer.eos_token_id,
+            self.tokenizer.convert_tokens_to_ids("<|eot_id|>"),
         ]
 
         encodeds = self.tokenizer.apply_chat_template(
@@ -325,16 +338,16 @@ class MistralAnswerGenerator(AnswerGenerator):
         generated_ids = self.model.generate(
             model_inputs,
             max_new_tokens=128,
+            eos_token_id=terminators,
             do_sample=True,
+            temperature=0.6,
             top_p=0.9,
-            temperature=0.9,
-            pad_token_id=2,
         )
-        response = (self.tokenizer.decode(generated_ids[0][model_inputs.shape[1] :]))[
-            :-4
-        ]
+        response = self.tokenizer.decode(
+            generated_ids[0][model_inputs.shape[1] :], skip_special_tokens=True
+        )
 
-        return response
+        return response.strip()
 
 
 class LLaMA3AnswerGenerator(AnswerGenerator):
@@ -424,6 +437,7 @@ class LLaMA3AnswerGenerator(AnswerGenerator):
         entry=None,
         entry_dict=None,
         entry_section=None,
+        image_path=None,
         oracle_setting="subject",
         evidence_sec=None,
     ):
@@ -437,38 +451,22 @@ class LLaMA3AnswerGenerator(AnswerGenerator):
             oracle_setting: The setting for the oracle experiment.
             evidence_sec: The evidence section.
         """
+        context = ""
         if entry is not None:
             context = reconstruct_wiki_article(entry)
-            context = _adjust_prompt_length(context, 4096)
-            prompt = (
-                "Context: " + context + "\nQuestion: " + question + "\nThe answer is:"
-            )
-
         elif entry_dict is not None:
             context = reconstruct_wiki_article(WikipediaKnowledgeBaseEntry(entry_dict))
-            prompt = (
-                "Entity name: "
-                + WikipediaKnowledgeBaseEntry(entry_dict).title
-                + "\nQuestion: "
-                + question
-                + "\nThe answer is:"
-            )
         elif entry_section is not None:
-            prompt = (
-                "Context: "
-                + entry_section
-                + "\nQuestion: "
-                + question
-                + "\nThe answer is:"
-            )
-        else:
-            # vanilla setting
-            prompt = "Question: " + question + "\nThe answer is:"
+            context = entry_section
+        if context:
+            context = _adjust_prompt_length(context, 4096)
+
+        prompt = _build_multimodal_prompt(question, context, include_image_hint=bool(image_path))
 
         messages = [
             {
                 "role": "system",
-                "content": "You are a helpful assistant for answering encyclopedic questions.",
+                "content": "You are a concise encyclopedic assistant. Answer with the most relevant fact grounded in the provided context and image. Do not add explanations.",
             },
             {"role": "user", "content": prompt},
         ]
@@ -488,9 +486,11 @@ class LLaMA3AnswerGenerator(AnswerGenerator):
             temperature=0.6,
             top_p=0.9,
         )
-        response = self.tokenizer.decode(generated_ids[0][model_inputs.shape[1] :])
+        response = self.tokenizer.decode(
+            generated_ids[0][model_inputs.shape[1] :], skip_special_tokens=True
+        )
 
-        return response
+        return response.strip()
 
 
 class GPT4AnswerGenerator(AnswerGenerator):
@@ -528,7 +528,7 @@ class GPT4AnswerGenerator(AnswerGenerator):
                 time.sleep(2)
         return assistant_reply
 
-    def llm_answering(self, question, entry=None, entry_dict=None, entry_section=None):
+    def llm_answering(self, question, entry=None, entry_dict=None, entry_section=None, image_path=None):
         """Answer the question for a given entry
 
         Args:
@@ -537,29 +537,17 @@ class GPT4AnswerGenerator(AnswerGenerator):
             entry_dict: The entry dictionary to answer the question for.
             entry_section: The entry section to answer the question for.
         """
+        context = ""
         if entry is not None:
             context = reconstruct_wiki_article(entry)
-            context = _adjust_prompt_length(context, 4096)
-
-            prompt = (
-                "Context: " + context + "\nQuestion: " + question + "\nThe answer is:"
-            )
         elif entry_dict is not None:
             context = reconstruct_wiki_article(WikipediaKnowledgeBaseEntry(entry_dict))
-            context = _adjust_prompt_length(context, 4096)
-            prompt = (
-                "Context: " + context + "\nQuestion: " + question + "\nThe answer is:"
-            )
         elif entry_section is not None:
-            prompt = (
-                "Context: "
-                + entry_section
-                + "\nQuestion: "
-                + question
-                + "\nThe answer is:"
-            )
-        else:
-            prompt = "Question: " + question + "\nThe answer is:"
+            context = entry_section
+        if context:
+            context = _adjust_prompt_length(context, 4096)
+
+        prompt = _build_multimodal_prompt(question, context, include_image_hint=bool(image_path))
         response = self.get_gpt4_answer(prompt)
         return response
 
@@ -585,7 +573,7 @@ class PaLMAnswerGenerator(AnswerGenerator):
         vertexai.init(project=PROJECT_ID, location=REGION)
         self.model = TextGenerationModel.from_pretrained("text-bison@002")
 
-    def llm_answering(self, question, entry=None, entry_dict=None, entry_section=None):
+    def llm_answering(self, question, entry=None, entry_dict=None, entry_section=None, image_path=None):
         """Answer the question for a given entry
 
         Args:
@@ -594,29 +582,17 @@ class PaLMAnswerGenerator(AnswerGenerator):
             entry_dict: The entry dictionary to answer the question for.
             entry_section: The entry section to answer the question for.
         """
+        context = ""
         if entry is not None:
             context = reconstruct_wiki_article(entry)
-            context = _adjust_prompt_length(context, 4096)
-
-            prompt = (
-                "Context: " + context + "\nQuestion: " + question + "\nThe answer is:"
-            )
         elif entry_dict is not None:
             context = reconstruct_wiki_article(WikipediaKnowledgeBaseEntry(entry_dict))
-            context = _adjust_prompt_length(context, 4096)
-            prompt = (
-                "Context: " + context + "\nQuestion: " + question + "\nThe answer is:"
-            )
         elif entry_section is not None:
-            prompt = (
-                "Context: "
-                + entry_section
-                + "\nQuestion: "
-                + question
-                + "\nThe answer is:"
-            )
-        else:
-            prompt = "Question: " + question + "\nThe answer is:"
+            context = entry_section
+        if context:
+            context = _adjust_prompt_length(context, 4096)
+
+        prompt = _build_multimodal_prompt(question, context, include_image_hint=bool(image_path))
 
         response = self.model.predict(
             prompt,
