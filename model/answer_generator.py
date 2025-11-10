@@ -122,18 +122,26 @@ def _adjust_prompt_length(prompt, desired_token_length):
 
 
 def _build_multimodal_prompt(question: str, context: str = "", include_image_hint: bool = False) -> str:
+    """Builds the USER content for chat models.
+
+    Context-aware prompt formatted as requested:
+    - With context:
+        Context: <CONTEXT>
+        Question: <QUESTION>
+        Just answer the question, no explanations.
+        Short answer is:
+    - Without context:
+        Question: <QUESTION>
+        Just answer the question, no explanations.
+        Short answer is:
+    """
     context = (context or "").strip()
     parts = []
     if context:
         parts.append(f"Context:\n{context}")
-    q_line = f"Question: {question.strip()}"
-    parts.append(q_line)
-    guidance = "Instructions: Provide a concise factual answer grounded in the provided context"
-    if include_image_hint:
-        guidance += " and the accompanying image"
-    guidance += ". Respond in at most two sentences."
-    parts.append(guidance)
-    parts.append("Short answer:")
+    parts.append(f"Question: {question.strip()}")
+    parts.append("Just answer the question, no explanations.")
+    parts.append("Short answer is:")
     return "\n".join(parts)
 
 
@@ -321,7 +329,7 @@ class MistralAnswerGenerator(AnswerGenerator):
         messages = [
             {
                 "role": "system",
-                "content": "You are a concise encyclopedic assistant. Answer with the most relevant fact grounded in the provided context and image. Do not add explanations.",
+                "content": "You always answer exactly the asked question. No extra text.",
             },
             {"role": "user", "content": prompt},
         ]
@@ -548,7 +556,11 @@ class GPT4AnswerGenerator(AnswerGenerator):
             context = _adjust_prompt_length(context, 4096)
 
         prompt = _build_multimodal_prompt(question, context, include_image_hint=bool(image_path))
-        response = self.get_gpt4_answer(prompt)
+        # Embed the desired SYSTEM line by sending it via system role in get_gpt4_answer
+        # Adjust get_gpt4_answer to use strict system instruction.
+        response = self.get_gpt4_answer(
+            f'SYSTEM: "You always answer exactly the asked question. No extra text."\nUSER:\n{prompt}'
+        )
         return response
 
 
@@ -595,7 +607,7 @@ class PaLMAnswerGenerator(AnswerGenerator):
         prompt = _build_multimodal_prompt(question, context, include_image_hint=bool(image_path))
 
         response = self.model.predict(
-            prompt,
+            f'SYSTEM: "You always answer exactly the asked question. No extra text."\nUSER:\n{prompt}',
             temperature=0.2,
             max_output_tokens=128,
             top_k=40,

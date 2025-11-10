@@ -489,42 +489,22 @@ class Router:
             image_token = comps.get("image_token", "<image>")
 
             # Format prompt similar to rag_flmm integration, with context-aware instructions
-            system_prompt = (prompt_template or {}).get("SYSTEM", "")
-            instruction_template = (prompt_template or {}).get("INSTRUCTION", "{input}")
-            roles = (prompt_template or {}).get("ROLES", ("USER", "ASSISTANT"))
-            user_role = roles[0] if isinstance(roles, (list, tuple)) and len(roles) >= 2 else "USER"
-            assistant_role = roles[1] if isinstance(roles, (list, tuple)) and len(roles) >= 2 else "ASSISTANT"
-
+            # Build prompt in the requested style. Keep image token on a separate line.
             question_text = str(question or "").strip()
             context_text = context.strip() if isinstance(context, str) else ""
-            if isinstance(instruction_template, str) and "{input}" in instruction_template:
-                formatted_question = instruction_template.format(input=question_text)
-            else:
-                formatted_question = question_text if instruction_template is None else f"{instruction_template}\n{question_text}"
-
-            user_blocks = []
+            user_lines = []
             if context_text:
-                user_blocks.append(f"Context:\n{context_text}")
-            user_blocks.append(f"Question: {formatted_question}")
-            user_blocks.append(
-                "Instructions: Provide a concise factual answer grounded in the image and any provided context. Respond in one or two sentences."
-            )
-            user_line = f"{user_role}: " + "\n".join(user_blocks)
-
-            assistant_label = (prompt_template or {}).get("ASSISTANT", assistant_role)
-            assistant_label = assistant_label.strip() or assistant_role
-            if not assistant_label.endswith(":"):
-                assistant_label = f"{assistant_label}:"
-            assistant_line = f"{assistant_label} Short answer:"
+                user_lines.append(f"Context:\n{context_text}")
+            user_lines.append(f"Question: {question_text}")
+            user_lines.append("Just answer the question, no explanations.")
+            user_lines.append("Short answer is:")
 
             parts = []
-            if system_prompt:
-                parts.append(system_prompt.strip())
+            parts.append('SYSTEM: "You always answer exactly the asked question. No extra text."')
             if image_token:
                 parts.append(image_token)
-            parts.append(user_line)
-            parts.append(assistant_line)
-            prompt = "\n".join(p for p in parts if p)
+            parts.append("USER:\n" + "\n".join(user_lines))
+            prompt = "\n".join(parts)
 
             tokenized = tokenizer(prompt, return_tensors="pt")
             input_ids = tokenized["input_ids"]

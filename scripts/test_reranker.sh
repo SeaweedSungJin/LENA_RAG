@@ -11,6 +11,11 @@ KB_JSON="${KB_JSON:-/dataset/evqa/encyclopedic_kb_wiki.json}"
 FAISS_INDEX_DIR="${FAISS_INDEX_DIR:-/dataset/evqa/}"
 QFORMER_CKPT="${QFORMER_CKPT:-${PROJECT_ROOT}/reranker.pth}"
 NLI_CONFIG="${NLI_CONFIG:-${PROJECT_ROOT}/config/nli.example.yaml}"
+DEFAULT_RUNTIME_CONFIG="${PROJECT_ROOT}/config/runtime.yaml"
+if [[ ! -f "${DEFAULT_RUNTIME_CONFIG}" ]]; then
+  DEFAULT_RUNTIME_CONFIG="${PROJECT_ROOT}/config/runtime.example.yaml"
+fi
+RUNTIME_CONFIG="${RUNTIME_CONFIG:-${DEFAULT_RUNTIME_CONFIG}}"
 DATASET_START="${DATASET_START:-}"
 DATASET_END="${DATASET_END:-}"
 DATASET_LIMIT="${DATASET_LIMIT:-}"
@@ -63,6 +68,10 @@ if [[ -n "${ROUTER_BACKEND}" ]]; then
 fi
 if [[ -n "${ROUTER_THRESHOLD}" ]]; then
   CMD+=(--router_threshold "${ROUTER_THRESHOLD}")
+fi
+
+if [[ -n "${RUNTIME_CONFIG}" && -f "${RUNTIME_CONFIG}" ]]; then
+  CMD+=(--runtime_config "${RUNTIME_CONFIG}")
 fi
 
 if [[ -n "${DATASET_START}" ]]; then

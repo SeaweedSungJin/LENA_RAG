@@ -12,3 +12,4 @@ e5_llava_hard_neg*
 data/*.json
 메모
 reranker.pth
+config/runs/

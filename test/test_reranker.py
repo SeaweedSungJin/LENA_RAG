@@ -8,6 +8,7 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 import PIL
 
+from config.runtime_config import RuntimeConfig
 from model import (
     ClipRetriever,
     MistralAnswerGenerator,
@@ -20,6 +21,7 @@ from model import (
     BgeTextReranker,
 )
 from utils import load_csv_data, get_test_question, get_image, remove_list_duplicates
+from utils.sample_logger import SampleLogger
 from nli import NLIConfig, NLISelector, SectionCandidate
 from nli.utils import parse_section_payload
 from router import Router, RouterConfig
@@ -85,6 +87,14 @@ def run_test(
     with open(iNat_image_path + "/val_id2name.json", "r") as f:
         iNat_id2name = json.load(f)
 
+    runtime_cfg: RuntimeConfig = kwargs.get("runtime_config") or RuntimeConfig.default()
+    sample_logger = SampleLogger(
+        runtime_cfg.samples_dir,
+        prefix=runtime_cfg.samples_prefix,
+        pretty=runtime_cfg.samples_pretty_json,
+    ) if runtime_cfg.log_samples else None
+    router_meta = kwargs.get("router_meta") or {}
+
     if kwargs["resume_from"] is not None:
         resumed_results = json.load(open(kwargs["resume_from"], "r"))
         kb_dict = json.load(open(knowledge_base_path, "r"))
@@ -103,11 +113,18 @@ def run_test(
     vqa_correct_count = 0
     question_generator = None
 
-    if kwargs["perform_vqa"]:
+    evaluate_answers = bool(kwargs.get("perform_vqa"))
+    need_generation = evaluate_answers or runtime_cfg.log_samples
+
+    evaluate_example_fn = None
+    if evaluate_answers:
         from utils import evaluate_example
         import tensorflow as tf
 
         tf.config.set_visible_devices([], "GPU")
+        evaluate_example_fn = evaluate_example
+
+    if need_generation:
         ag = (kwargs.get("answer_generator") or "mistral").lower()
         llm_ckpt = kwargs.get("llm_checkpoint")
         llm_device = kwargs.get("llm_device", "cuda:0")
@@ -131,7 +148,6 @@ def run_test(
             )
         else:
             if not llm_ckpt:
-                # Default to HF Mistral repo when no checkpoint is provided
                 llm_ckpt = "mistralai/Mistral-7B-Instruct-v0.2"
             question_generator = MistralAnswerGenerator(
                 model_path=llm_ckpt,
@@ -144,8 +160,8 @@ def run_test(
                 torch_dtype=llm_dtype,
             )
 
-    def _generate_answer_with_image(question: str, image_path: str, context_text: str = "", *, max_new_tokens: int | None = 128):
-        max_tokens = int(max_new_tokens or 128)
+    def _generate_answer_with_image(question: str, image_path: str, context_text: str = "", *, max_new_tokens: int | None = None):
+        max_tokens = int(max_new_tokens or runtime_cfg.vlm_max_new_tokens)
         answer = None
         context_payload = (context_text or "").strip()
         if router is not None and hasattr(router, "generate_vlm_answer"):
@@ -165,6 +181,31 @@ def run_test(
                 image_path=image_path,
             )
         return answer
+
+    def _log_sample(sample_idx: int, *, answer: Optional[str], target_answer: List[str], use_rag: bool,
+                    context_sections: List[str], reranked_sections: List[str], top_urls: List[str],
+                    router_prob: Optional[float], router_backend: Optional[str], image_path: str, question: str) -> None:
+        if not sample_logger:
+            return
+        limited_context = context_sections[: runtime_cfg.samples_max_sections]
+        limited_sections = reranked_sections[: runtime_cfg.samples_max_sections]
+        payload = {
+            "question": question,
+            "image_path": image_path,
+            "router_prob": router_prob,
+            "router_threshold": router_meta.get("threshold"),
+            "router_backend": router_backend,
+            "use_rag": bool(use_rag),
+            "answer": answer,
+            "target_answer": target_answer,
+            "context_sections": limited_context,
+            "retrieval": {
+                "use_retrieval": bool(use_rag),
+                "top_urls": top_urls[: runtime_cfg.samples_max_sections],
+                "sections": limited_sections,
+            },
+        }
+        sample_logger.log(sample_idx, payload)
     if kwargs["perform_text_rerank"]:
         text_reranker = BgeTextReranker(
             model_path="/remote-home/share/huggingface_model/bge-reranker-v2-m3",
@@ -251,14 +292,14 @@ def run_test(
             count_so_far = processed_idx + 1
             direct_answer = None
             ctx_text = ""
-            if kwargs["perform_vqa"]:
+            if need_generation:
                 direct_answer = _generate_answer_with_image(
-                    example["question"], image_path, ctx_text, max_new_tokens=kwargs.get("vlm_max_new_tokens", 128)
+                    example["question"], image_path, ctx_text, max_new_tokens=runtime_cfg.vlm_max_new_tokens
                 )
-                if direct_answer:
+                if evaluate_answers and direct_answer and evaluate_example_fn is not None:
                     print("answer: ", direct_answer)
                     print("target answer: ", target_answer)
-                    score = evaluate_example(
+                    score = evaluate_example_fn(
                         example["question"],
                         reference_list=target_answer,
                         candidate=direct_answer,
@@ -279,6 +320,20 @@ def run_test(
                     "use_rag": False,
                     "answer": direct_answer,
                 }
+            if sample_logger and (runtime_cfg.log_samples or evaluate_answers):
+                _log_sample(
+                    dataset_idx,
+                    answer=direct_answer,
+                    target_answer=target_answer,
+                    use_rag=False,
+                    context_sections=[],
+                    reranked_sections=[],
+                    top_urls=[],
+                    router_prob=router_prob,
+                    router_backend=router_backend,
+                    image_path=image_path,
+                    question=example["question"],
+                )
             continue
         else:
             router_true_count += 1
@@ -403,27 +458,42 @@ def run_test(
         if kwargs["save_result"]:
             retrieval_result[data_id]["reranked_sections"] = reranked_sections[:10]
 
-        if kwargs["perform_vqa"]:
+        if need_generation:
             ctx_n = max(1, int(nli_context_sentences))
             ctx = reranked_sections[:ctx_n] if reranked_sections else (sections[:ctx_n] if sections else [""])
             ctx_text = "\n\n".join(ctx)
             answer = _generate_answer_with_image(
-                example["question"], image_path, ctx_text, max_new_tokens=kwargs.get("vlm_max_new_tokens", 128)
+                example["question"], image_path, ctx_text, max_new_tokens=runtime_cfg.vlm_max_new_tokens
             )
-            print("answer: ", answer)
-            print("target answer: ", target_answer)
-            score = evaluate_example(
-                example["question"],
-                reference_list=target_answer,
-                candidate=answer,
-                question_type=example["question_type"],
-            )
-            eval_score += score
-            vqa_total_count += 1
-            if score >= 0.5:
-                vqa_correct_count += 1
-            print("score: ", score, "iter: ", count_so_far)
-            print("eval score: ", eval_score / count_so_far)
+            if evaluate_answers and answer and evaluate_example_fn is not None:
+                print("answer: ", answer)
+                print("target answer: ", target_answer)
+                score = evaluate_example_fn(
+                    example["question"],
+                    reference_list=target_answer,
+                    candidate=answer,
+                    question_type=example["question_type"],
+                )
+                eval_score += score
+                vqa_total_count += 1
+                if score >= 0.5:
+                    vqa_correct_count += 1
+                print("score: ", score, "iter: ", count_so_far)
+                print("eval score: ", eval_score / count_so_far)
+            if sample_logger and (runtime_cfg.log_samples or evaluate_answers):
+                _log_sample(
+                    dataset_idx,
+                    answer=answer,
+                    target_answer=target_answer,
+                    use_rag=True,
+                    context_sections=ctx,
+                    reranked_sections=reranked_sections,
+                    top_urls=top_k_wiki,
+                    router_prob=router_prob,
+                    router_backend=router_backend,
+                    image_path=image_path,
+                    question=example["question"],
+                )
 
     if kwargs["save_result"]:
         with open(kwargs["save_result_path"], "w") as f:
@@ -443,7 +513,7 @@ def run_test(
     else:
         print("=== Router Summary ===")
         print("Router disabled for this run.")
-    if kwargs.get("perform_vqa", False) and vqa_total_count > 0:
+    if evaluate_answers and vqa_total_count > 0:
         avg_bem = eval_score / vqa_total_count
         acc = vqa_correct_count / vqa_total_count
         print("========== Final VQA Summary ==========")
@@ -581,37 +651,52 @@ def run_test(
             hits += hit
             print("Text Reranking Recalls", hits / count_so_far)
 
-        if kwargs["perform_vqa"]:
+        if need_generation:
             ctx_text = reranked_sections[0] if reranked_sections else ""
             answer = _generate_answer_with_image(
-                example["question"], image_path, ctx_text, max_new_tokens=kwargs.get("vlm_max_new_tokens", 128)
+                example["question"], image_path, ctx_text, max_new_tokens=runtime_cfg.vlm_max_new_tokens
             )
 
-            print("answer: ", answer)
-            print("target answer: ", target_answer)
-            score = evaluate_example(
-                example["question"],
-                reference_list=target_answer,
-                candidate=answer,
-                question_type=example["question_type"],
-            )
+            if evaluate_answers and answer and evaluate_example_fn is not None:
+                print("answer: ", answer)
+                print("target answer: ", target_answer)
+                score = evaluate_example_fn(
+                    example["question"],
+                    reference_list=target_answer,
+                    candidate=answer,
+                    question_type=example["question_type"],
+                )
 
-            eval_score += score
-            vqa_total_count += 1
-            if score >= 0.5:
-                vqa_correct_count += 1
-            print("score: ", score, "iter: ", count_so_far)
-            print("eval score: ", eval_score / count_so_far)
-            print(
-                "vqa acc:", f"{vqa_correct_count}/{vqa_total_count}",
-                f"({(vqa_correct_count / max(1, vqa_total_count)) * 100:.2f}% )",
-            )
+                eval_score += score
+                vqa_total_count += 1
+                if score >= 0.5:
+                    vqa_correct_count += 1
+                print("score: ", score, "iter: ", count_so_far)
+                print("eval score: ", eval_score / count_so_far)
+                print(
+                    "vqa acc:", f"{vqa_correct_count}/{vqa_total_count}",
+                    f"({(vqa_correct_count / max(1, vqa_total_count)) * 100:.2f}% )",
+                )
+            if sample_logger and (runtime_cfg.log_samples or evaluate_answers):
+                _log_sample(
+                    dataset_idx,
+                    answer=answer,
+                    target_answer=target_answer,
+                    use_rag=True,
+                    context_sections=[ctx_text] if ctx_text else [],
+                    reranked_sections=reranked_sections,
+                    top_urls=top_k_wiki,
+                    router_prob=router_prob,
+                    router_backend=router_backend,
+                    image_path=image_path,
+                    question=example["question"],
+                )
     if kwargs["save_result"]:
         with open(kwargs["save_result_path"], "w") as f:
             json.dump(retrieval_result, f, indent=4)
 
     # Final summary lines
-    if kwargs.get("perform_vqa", False) and vqa_total_count > 0:
+    if evaluate_answers and vqa_total_count > 0:
         avg_bem = eval_score / vqa_total_count
         acc = vqa_correct_count / vqa_total_count
         print("========== Final VQA Summary ==========")
@@ -656,6 +741,7 @@ if __name__ == "__main__":
     parser.add_argument("--router_threshold", type=float, default=None)
     parser.add_argument("--router_backend", type=str, default=None)
     parser.add_argument("--disable_router", action="store_true")
+    parser.add_argument("--runtime_config", type=str, default=None)
     parser.add_argument("--enable_nli", action="store_true")
     parser.add_argument("--nli_config", type=str, default=None)
     parser.add_argument("--nli_model", type=str, default=None)
@@ -748,6 +834,12 @@ if __name__ == "__main__":
         enable_router = True
     if getattr(args, "disable_router", False):
         enable_router = False
+
+    runtime_cfg_path = args.runtime_config or os.getenv("RUNTIME_CONFIG")
+    if runtime_cfg_path:
+        runtime_cfg = RuntimeConfig.from_yaml(runtime_cfg_path)
+    else:
+        runtime_cfg = RuntimeConfig.default()
 
     router_instance: Optional[Router] = None
     if enable_router:
@@ -844,6 +936,12 @@ if __name__ == "__main__":
         "nli_section_limit": args.nli_section_limit,
         "nli_context_sentences": args.nli_context_sentences,
         "router": router_instance,
+        "runtime_config": runtime_cfg,
+        "router_meta": {
+            "enabled": enable_router,
+            "threshold": router_cfg.threshold if enable_router else router_cfg.threshold,
+            "backend": router_cfg.backend,
+        },
     }
     debug_config = {k: v for k, v in test_config.items() if k != "nli_selector"}
     debug_config["enable_nli"] = enable_nli
@@ -856,6 +954,7 @@ if __name__ == "__main__":
     debug_config["router_backend"] = router_instance.backend_name if router_instance is not None else router_cfg.backend if enable_router else None
     debug_config["router_threshold"] = router_cfg.threshold if enable_router else None
     debug_config["router_config_path"] = str(router_cfg.config_path) if router_cfg.config_path else router_cfg_path
+    debug_config["runtime_config"] = runtime_cfg.to_dict() if hasattr(runtime_cfg, "to_dict") else {}
     print(f"[Runner] file={__file__}")
     print("test_config: ", debug_config)
     run_test(**test_config)

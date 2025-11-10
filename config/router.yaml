@@ -1,4 +1,4 @@
-enabled: true
+enabled: false  #false면 라우터 없이
 backend: mmengine
 threshold: 0.5
 device: cuda:1

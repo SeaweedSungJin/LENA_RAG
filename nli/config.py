@@ -16,6 +16,7 @@ class NLIConfig:
     device: str = "cuda:0"
     max_length: int = 512
     batch_size: int = 32
+    question_mode: str = "statement"
     # Question-to-statement conversion
     convert_question: bool = True
     question_entail_threshold: float = 0.5
@@ -45,6 +46,13 @@ class NLIConfig:
 
     extra: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        mode = (self.question_mode or ("statement" if self.convert_question else "question")).strip().lower()
+        if mode not in {"statement", "question"}:
+            mode = "statement"
+        self.question_mode = mode
+        self.convert_question = mode != "question"
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> "NLIConfig":
         with Path(path).open("r", encoding="utf-8") as f:
@@ -61,6 +69,7 @@ class NLIConfig:
             "device": self.device,
             "max_length": self.max_length,
             "batch_size": self.batch_size,
+            "question_mode": self.question_mode,
             "convert_question": self.convert_question,
             "question_entail_threshold": self.question_entail_threshold,
             "alpha": self.alpha,
@@ -84,4 +93,3 @@ class NLIConfig:
         }
         payload.update(self.extra)
         return payload
-
