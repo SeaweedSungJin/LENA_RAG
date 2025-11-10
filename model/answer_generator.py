@@ -314,22 +314,38 @@ class MistralAnswerGenerator(AnswerGenerator):
             oracle_setting: The setting for the oracle experiment.
             evidence_sec: The evidence section.
         """
-        context = ""
         if entry is not None:
             context = reconstruct_wiki_article(entry)
+            context = _adjust_prompt_length(context, 4096)
+            prompt = (
+                "Context: " + context + "\nQuestion: " + question + "\nThe answer is:"
+            )
+
         elif entry_dict is not None:
             context = reconstruct_wiki_article(WikipediaKnowledgeBaseEntry(entry_dict))
+            prompt = (
+                "Entity name: "
+                + WikipediaKnowledgeBaseEntry(entry_dict).title
+                + "\nQuestion: "
+                + question
+                + "\nThe answer is:"
+            )
         elif entry_section is not None:
-            context = entry_section
-        if context:
-            context = _adjust_prompt_length(context, 4096)
-
-        prompt = _build_multimodal_prompt(question, context, include_image_hint=bool(image_path))
+            prompt = (
+                "Context: "
+                + entry_section
+                + "\nQuestion: "
+                + question
+                + "\nThe answer is:"
+            )
+        else:
+            # vanilla setting
+            prompt = "Question: " + question + "\nThe answer is:"
 
         messages = [
             {
                 "role": "system",
-                "content": "You always answer exactly the asked question. No extra text.",
+                "content": "You are a helpful assistant for answering encyclopedic questions.",
             },
             {"role": "user", "content": prompt},
         ]
@@ -351,11 +367,9 @@ class MistralAnswerGenerator(AnswerGenerator):
             temperature=0.6,
             top_p=0.9,
         )
-        response = self.tokenizer.decode(
-            generated_ids[0][model_inputs.shape[1] :], skip_special_tokens=True
-        )
+        response = self.tokenizer.decode(generated_ids[0][model_inputs.shape[1] :])
 
-        return response.strip()
+        return response
 
 
 class LLaMA3AnswerGenerator(AnswerGenerator):
@@ -459,22 +473,37 @@ class LLaMA3AnswerGenerator(AnswerGenerator):
             oracle_setting: The setting for the oracle experiment.
             evidence_sec: The evidence section.
         """
-        context = ""
         if entry is not None:
             context = reconstruct_wiki_article(entry)
+            context = _adjust_prompt_length(context, 4096)
+            prompt = (
+                "Context: " + context + "\nQuestion: " + question + "\nThe answer is:"
+            )
+
         elif entry_dict is not None:
             context = reconstruct_wiki_article(WikipediaKnowledgeBaseEntry(entry_dict))
+            prompt = (
+                "Entity name: "
+                + WikipediaKnowledgeBaseEntry(entry_dict).title
+                + "\nQuestion: "
+                + question
+                + "\nThe answer is:"
+            )
         elif entry_section is not None:
-            context = entry_section
-        if context:
-            context = _adjust_prompt_length(context, 4096)
-
-        prompt = _build_multimodal_prompt(question, context, include_image_hint=bool(image_path))
+            prompt = (
+                "Context: "
+                + entry_section
+                + "\nQuestion: "
+                + question
+                + "\nThe answer is:"
+            )
+        else:
+            prompt = "Question: " + question + "\nThe answer is:"
 
         messages = [
             {
                 "role": "system",
-                "content": "You are a concise encyclopedic assistant. Answer with the most relevant fact grounded in the provided context and image. Do not add explanations.",
+                "content": "You are a helpful assistant for answering encyclopedic questions.",
             },
             {"role": "user", "content": prompt},
         ]
@@ -494,11 +523,9 @@ class LLaMA3AnswerGenerator(AnswerGenerator):
             temperature=0.6,
             top_p=0.9,
         )
-        response = self.tokenizer.decode(
-            generated_ids[0][model_inputs.shape[1] :], skip_special_tokens=True
-        )
+        response = self.tokenizer.decode(generated_ids[0][model_inputs.shape[1] :])
 
-        return response.strip()
+        return response
 
 
 class GPT4AnswerGenerator(AnswerGenerator):
@@ -555,12 +582,31 @@ class GPT4AnswerGenerator(AnswerGenerator):
         if context:
             context = _adjust_prompt_length(context, 4096)
 
-        prompt = _build_multimodal_prompt(question, context, include_image_hint=bool(image_path))
-        # Embed the desired SYSTEM line by sending it via system role in get_gpt4_answer
-        # Adjust get_gpt4_answer to use strict system instruction.
-        response = self.get_gpt4_answer(
-            f'SYSTEM: "You always answer exactly the asked question. No extra text."\nUSER:\n{prompt}'
-        )
+        if entry is not None:
+            context = _adjust_prompt_length(context, 4096)
+            prompt = (
+                "Context: " + context + "\nQuestion: " + question + "\nThe answer is:"
+            )
+        elif entry_dict is not None:
+            prompt = (
+                "Entity name: "
+                + WikipediaKnowledgeBaseEntry(entry_dict).title
+                + "\nQuestion: "
+                + question
+                + "\nThe answer is:"
+            )
+        elif entry_section is not None:
+            prompt = (
+                "Context: "
+                + entry_section
+                + "\nQuestion: "
+                + question
+                + "\nThe answer is:"
+            )
+        else:
+            prompt = "Question: " + question + "\nThe answer is:"
+
+        response = self.get_gpt4_answer(prompt)
         return response
 
 
@@ -604,10 +650,32 @@ class PaLMAnswerGenerator(AnswerGenerator):
         if context:
             context = _adjust_prompt_length(context, 4096)
 
-        prompt = _build_multimodal_prompt(question, context, include_image_hint=bool(image_path))
+        if entry is not None:
+            context = _adjust_prompt_length(context, 4096)
+            prompt = (
+                "Context: " + context + "\nQuestion: " + question + "\nThe answer is:"
+            )
+        elif entry_dict is not None:
+            prompt = (
+                "Entity name: "
+                + WikipediaKnowledgeBaseEntry(entry_dict).title
+                + "\nQuestion: "
+                + question
+                + "\nThe answer is:"
+            )
+        elif entry_section is not None:
+            prompt = (
+                "Context: "
+                + entry_section
+                + "\nQuestion: "
+                + question
+                + "\nThe answer is:"
+            )
+        else:
+            prompt = "Question: " + question + "\nThe answer is:"
 
         response = self.model.predict(
-            f'SYSTEM: "You always answer exactly the asked question. No extra text."\nUSER:\n{prompt}',
+            prompt,
             temperature=0.2,
             max_output_tokens=128,
             top_k=40,
